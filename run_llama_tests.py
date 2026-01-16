@@ -188,17 +188,37 @@ def auto_detect_model():
     return best_path or ""
 
 
+def _find_llama_cpp_dir():
+    search_roots = [SCRIPT_DIR, *SCRIPT_DIR.parents]
+    for base in search_roots:
+        if base.name == "llama.cpp":
+            return str(base)
+        candidate = base / "llama.cpp"
+        if candidate.is_dir():
+            return str(candidate)
+    return ""
+
+
 def auto_detect_server_bin():
     env_bin = os.environ.get("LLAMA_SERVER_BIN")
     if env_bin and os.path.isfile(env_bin):
         return env_bin
 
-    cpp_dir = os.environ.get("LLAMA_CPP_DIR")
+    cpp_dir = os.environ.get("LLAMA_CPP_DIR") or _find_llama_cpp_dir()
     candidates = []
     if cpp_dir:
-        candidates.append(os.path.join(cpp_dir, "build", "bin", "llama-server"))
+        candidates.extend(
+            [
+                os.path.join(cpp_dir, "build", "bin", "llama-server"),
+                os.path.join(cpp_dir, "build", "bin", "server"),
+                os.path.join(cpp_dir, "llama-server"),
+                os.path.join(cpp_dir, "server"),
+            ]
+        )
 
-    candidates.append(os.path.join(SCRIPT_DIR, "llama.cpp", "build", "bin", "llama-server"))
+    candidates.append(
+        os.path.join(SCRIPT_DIR, "llama.cpp", "build", "bin", "llama-server")
+    )
     candidates.append(shutil.which("llama-server") or "")
 
     for candidate in candidates:

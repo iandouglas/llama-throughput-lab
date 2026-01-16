@@ -27,8 +27,8 @@ The launcher lets you pick a test/sweep, select a GGUF model file, and enter env
 Use the interactive menu to pick tests or sweeps and supply optional env overrides.
 The launcher will try to auto-detect a `.gguf` in common locations unless you
 pick one or set `LLAMA_MODEL_PATH`.
-It also auto-detects `llama-server` from `LLAMA_CPP_DIR`, `./llama.cpp`, or `PATH`
-unless you set it in the menu.
+It also auto-detects `llama-server` from `LLAMA_CPP_DIR`, walking up parent
+directories to find `llama.cpp`, or `PATH` unless you set it in the menu.
 
 ```bash
 ./run_llama_tests.py
@@ -132,6 +132,8 @@ You can supply overrides in the launcher (space-separated `KEY=VALUE` pairs), or
 - `LLAMA_CONCURRENCY_LIST`: list of concurrencies (sweeps).
 - `LLAMA_INSTANCES_LIST`: list of instance counts (full sweep).
 - `LLAMA_PARALLEL_LIST`: list of `--parallel` values (full sweep).
+- `LLAMA_BATCH_LIST`: list for `--batch-size` (round-robin/full sweep, use `default` to skip).
+- `LLAMA_UBATCH_LIST`: list for `--ubatch` (round-robin/full sweep, use `default` to skip).
 - `LLAMA_REQUESTS_MULTIPLIER`: if `LLAMA_NUM_REQUESTS` is unset, total requests = concurrency * multiplier.
 - `LLAMA_REQUEST_TIMEOUT`: per-request timeout (seconds).
 - `LLAMA_RETRY_ATTEMPTS`: retries for transient HTTP errors.

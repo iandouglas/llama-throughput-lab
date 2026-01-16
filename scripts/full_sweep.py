@@ -19,8 +19,20 @@ def parse_int_list(value, default):
     parts = [item.strip() for item in raw.replace(",", " ").split()]
     return [int(item) for item in parts if item]
 
+def parse_optional_int_list(value, default):
+    raw = value or default
+    parts = [item.strip() for item in raw.replace(",", " ").split()]
+    result = []
+    for item in parts:
+        if not item:
+            continue
+        if item.lower() == "default":
+            result.append(None)
+        else:
+            result.append(int(item))
+    return result or [None]
 
-def build_server_args(base_args, parallel):
+def build_server_args(base_args, parallel, batch_size, ubatch_size):
     if base_args:
         args = shlex.split(base_args)
     else:
@@ -32,12 +44,22 @@ def build_server_args(base_args, parallel):
         if skip_next:
             skip_next = False
             continue
-        if arg == "--parallel":
+        if arg in {"--parallel", "--batch-size", "--ubatch", "-b"}:
             skip_next = True
+            continue
+        if arg.startswith("--parallel="):
+            continue
+        if arg.startswith("--batch-size="):
+            continue
+        if arg.startswith("--ubatch="):
             continue
         cleaned.append(arg)
 
     cleaned += ["--parallel", str(parallel)]
+    if batch_size is not None:
+        cleaned += ["--batch-size", str(batch_size)]
+    if ubatch_size is not None:
+        cleaned += ["--ubatch", str(ubatch_size)]
     return cleaned
 
 
@@ -134,6 +156,14 @@ def main():
         os.environ.get("LLAMA_PARALLEL_LIST"),
         "1,2,4,8,16,32,64",
     )
+    batch_list = parse_optional_int_list(
+        os.environ.get("LLAMA_BATCH_LIST"),
+        "default",
+    )
+    ubatch_list = parse_optional_int_list(
+        os.environ.get("LLAMA_UBATCH_LIST"),
+        "default",
+    )
     concurrency_list = parse_int_list(
         os.environ.get("LLAMA_CONCURRENCY_LIST"),
         "1,2,4,8,16,32,64,128,256,512,1024",
@@ -157,86 +187,106 @@ def main():
         requests_multiplier = 1
 
     print(
-        "instances,parallel,concurrency,throughput_tps,total_tokens,elapsed_s,errors"
+        "instances,parallel,batch,ubatch,concurrency,throughput_tps,"
+        "total_tokens,elapsed_s,errors"
     )
 
     best = {
         "throughput": 0.0,
         "instances": None,
         "parallel": None,
+        "batch": None,
+        "ubatch": None,
         "concurrency": None,
     }
 
     for instances in instances_list:
         for parallel in parallel_list:
-            server_args = build_server_args(base_args, parallel)
-            with start_llama_servers(
-                instances,
-                base_port=base_port,
-                extra_args=server_args,
-                ready_timeout_s=ready_timeout_s,
-                startup_delay_s=startup_delay_s,
-            ) as servers:
-                upstreams = [(server["host"], server["port"]) for server in servers]
-                with start_nginx_round_robin(
-                    upstreams,
-                    listen_port=nginx_port,
-                    listen_host=servers[0]["host"],
-                ) as proxy:
-                    if warmup_requests > 0:
-                        for _ in range(warmup_requests):
-                            post_json_with_retry(
-                                f"{proxy['base_url']}/completion",
-                                {
-                                    "prompt": "warmup",
-                                    "n_predict": 8,
-                                    "temperature": 0.0,
-                                    "stream": False,
-                                },
-                                request_timeout,
-                                retry_attempts,
-                                retry_sleep_s,
-                            )
+            for batch_size in batch_list:
+                for ubatch_size in ubatch_list:
+                    server_args = build_server_args(
+                        base_args, parallel, batch_size, ubatch_size
+                    )
+                    with start_llama_servers(
+                        instances,
+                        base_port=base_port,
+                        extra_args=server_args,
+                        ready_timeout_s=ready_timeout_s,
+                        startup_delay_s=startup_delay_s,
+                    ) as servers:
+                        upstreams = [
+                            (server["host"], server["port"]) for server in servers
+                        ]
+                        with start_nginx_round_robin(
+                            upstreams,
+                            listen_port=nginx_port,
+                            listen_host=servers[0]["host"],
+                        ) as proxy:
+                            if warmup_requests > 0:
+                                for _ in range(warmup_requests):
+                                    post_json_with_retry(
+                                        f"{proxy['base_url']}/completion",
+                                        {
+                                            "prompt": "warmup",
+                                            "n_predict": 8,
+                                            "temperature": 0.0,
+                                            "stream": False,
+                                        },
+                                        request_timeout,
+                                        retry_attempts,
+                                        retry_sleep_s,
+                                    )
 
-                    for concurrency in concurrency_list:
-                        if total_requests_env:
-                            total_requests = int(total_requests_env)
-                        else:
-                            total_requests = max(
-                                1, concurrency * requests_multiplier
+                            batch_label = (
+                                "default" if batch_size is None else str(batch_size)
                             )
-                        result = run_batch(
-                            proxy["base_url"],
-                            prompt,
-                            n_predict,
-                            concurrency,
-                            total_requests,
-                            temperature,
-                            request_timeout,
-                            retry_attempts,
-                            retry_sleep_s,
-                        )
-                        print(
-                            f"{instances},{parallel},{concurrency},"
-                            f"{result['throughput']:.1f},"
-                            f"{result['total_tokens']},"
-                            f"{result['elapsed']:.2f},"
-                            f"{result['errors']}"
-                        )
-                        if result["throughput"] > best["throughput"]:
-                            best = {
-                                "throughput": result["throughput"],
-                                "instances": instances,
-                                "parallel": parallel,
-                                "concurrency": concurrency,
-                            }
-                        if cell_pause_s > 0:
-                            time.sleep(cell_pause_s)
+                            ubatch_label = (
+                                "default" if ubatch_size is None else str(ubatch_size)
+                            )
+                            for concurrency in concurrency_list:
+                                if total_requests_env:
+                                    total_requests = int(total_requests_env)
+                                else:
+                                    total_requests = max(
+                                        1, concurrency * requests_multiplier
+                                    )
+                                result = run_batch(
+                                    proxy["base_url"],
+                                    prompt,
+                                    n_predict,
+                                    concurrency,
+                                    total_requests,
+                                    temperature,
+                                    request_timeout,
+                                    retry_attempts,
+                                    retry_sleep_s,
+                                )
+                                print(
+                                    f"{instances},{parallel},{batch_label},"
+                                    f"{ubatch_label},{concurrency},"
+                                    f"{result['throughput']:.1f},"
+                                    f"{result['total_tokens']},"
+                                    f"{result['elapsed']:.2f},"
+                                    f"{result['errors']}"
+                                )
+                                if result["throughput"] > best["throughput"]:
+                                    best = {
+                                        "throughput": result["throughput"],
+                                        "instances": instances,
+                                        "parallel": parallel,
+                                        "batch": batch_label,
+                                        "ubatch": ubatch_label,
+                                        "concurrency": concurrency,
+                                    }
+                                if cell_pause_s > 0:
+                                    time.sleep(cell_pause_s)
 
     print(
         "best "
         f"instances={best['instances']} "
         f"parallel={best['parallel']} "
+        f"batch={best['batch']} "
+        f"ubatch={best['ubatch']} "
         f"concurrency={best['concurrency']} "
         f"throughput_tps={best['throughput']:.1f}"
     )

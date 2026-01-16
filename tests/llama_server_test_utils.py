@@ -15,14 +15,39 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8080
 
 
+def _find_llama_cpp_dir():
+    search_roots = [REPO_ROOT, *REPO_ROOT.parents]
+    for base in search_roots:
+        if base.name == "llama.cpp":
+            if (
+                (base / "build" / "bin" / "llama-server").is_file()
+                or (base / "build" / "bin" / "server").is_file()
+                or (base / "llama-server").is_file()
+                or (base / "server").is_file()
+            ):
+                return str(base)
+
+        candidate = base / "llama.cpp"
+        if candidate.is_dir():
+            if (
+                (candidate / "build" / "bin" / "llama-server").is_file()
+                or (candidate / "build" / "bin" / "server").is_file()
+                or (candidate / "llama-server").is_file()
+                or (candidate / "server").is_file()
+            ):
+                return str(candidate)
+
+    return ""
+
+
 def resolve_llama_cpp_dir():
     env_dir = os.environ.get("LLAMA_CPP_DIR")
     if env_dir:
         return env_dir
 
-    candidate = REPO_ROOT / "llama.cpp"
-    if candidate.is_dir():
-        return str(candidate)
+    detected = _find_llama_cpp_dir()
+    if detected:
+        return detected
 
     return "llama.cpp"
 
