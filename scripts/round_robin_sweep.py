@@ -1,8 +1,10 @@
+import csv
 import os
 import shlex
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
@@ -32,6 +34,14 @@ def _parse_optional_int_list(value, default):
         else:
             result.append(int(item))
     return result or [None]
+
+
+def init_results_file(subdir, prefix):
+    base_dir = Path(os.environ.get("LLAMA_RESULTS_DIR", "results")).expanduser()
+    results_dir = base_dir / subdir
+    results_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    return results_dir / f"{prefix}_{timestamp}.csv"
 
 
 def _format_cell(value, width):
@@ -66,6 +76,9 @@ def post_json_with_retry(url, payload, max_attempts=8, base_sleep_s=0.5):
 
 def run_batch(base_url, prompt, n_predict, concurrency, total_requests, temperature):
     start_time = time.time()
+    results = []
+    errors = 0
+    last_error = None
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = [
             executor.submit(
@@ -80,12 +93,23 @@ def run_batch(base_url, prompt, n_predict, concurrency, total_requests, temperat
             )
             for _ in range(total_requests)
         ]
-        results = [future.result() for future in as_completed(futures)]
+        for future in as_completed(futures):
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                errors += 1
+                last_error = exc
     total_time = time.time() - start_time
 
     total_tokens = sum(extract_token_count(result) for result in results)
     throughput = total_tokens / total_time if total_time > 0 else 0.0
-    return throughput
+    return {
+        "throughput": throughput,
+        "total_tokens": total_tokens,
+        "elapsed": total_time,
+        "errors": errors,
+        "last_error": last_error,
+    }
 
 
 def _build_server_args(base_args, batch_size, ubatch_size):
@@ -157,6 +181,26 @@ def main():
     if requests_multiplier < 1:
         requests_multiplier = 1
 
+    results_path = init_results_file("round_robin_sweep", "round_robin_sweep")
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    results_file = results_path.open("w", newline="", encoding="utf-8")
+    writer = csv.writer(results_file)
+    writer.writerow(
+        [
+            "batch",
+            "ubatch",
+            "max_tokens",
+            "concurrency",
+            "throughput_tps",
+            "total_tokens",
+            "elapsed_s",
+            "errors",
+        ]
+    )
+    results_file.flush()
+
+    print(f"results_file={results_path}")
+
     best = {
         "throughput": 0.0,
         "tokens": None,
@@ -165,97 +209,154 @@ def main():
         "ubatch": None,
     }
 
-    for batch_size in batch_list:
-        for ubatch_size in ubatch_list:
-            extra_args = _build_server_args(base_args, batch_size, ubatch_size)
-            batch_label = "default" if batch_size is None else str(batch_size)
-            ubatch_label = "default" if ubatch_size is None else str(ubatch_size)
-            try:
-                with start_llama_servers(
-                    instance_count,
-                    base_port=base_port,
-                    ready_timeout_s=ready_timeout_s,
-                    startup_delay_s=startup_delay_s,
-                    extra_args=extra_args,
-                ) as servers:
-                    upstreams = [(server["host"], server["port"]) for server in servers]
-                    with start_nginx_round_robin(
-                        upstreams,
-                        listen_port=nginx_port,
-                        listen_host=servers[0]["host"],
-                    ) as proxy:
-                        if warmup_requests > 0:
-                            for _ in range(warmup_requests):
-                                post_json_with_retry(
-                                    f"{proxy['base_url']}/completion",
-                                    {
-                                        "prompt": "warmup",
-                                        "n_predict": 8,
-                                        "temperature": 0.0,
-                                        "stream": False,
-                                    },
+    try:
+        for batch_size in batch_list:
+            for ubatch_size in ubatch_list:
+                extra_args = _build_server_args(base_args, batch_size, ubatch_size)
+                batch_label = "default" if batch_size is None else str(batch_size)
+                ubatch_label = "default" if ubatch_size is None else str(ubatch_size)
+                try:
+                    with start_llama_servers(
+                        instance_count,
+                        base_port=base_port,
+                        ready_timeout_s=ready_timeout_s,
+                        startup_delay_s=startup_delay_s,
+                        extra_args=extra_args,
+                    ) as servers:
+                        upstreams = [
+                            (server["host"], server["port"]) for server in servers
+                        ]
+                        with start_nginx_round_robin(
+                            upstreams,
+                            listen_port=nginx_port,
+                            listen_host=servers[0]["host"],
+                        ) as proxy:
+                            if warmup_requests > 0:
+                                for _ in range(warmup_requests):
+                                    post_json_with_retry(
+                                        f"{proxy['base_url']}/completion",
+                                        {
+                                            "prompt": "warmup",
+                                            "n_predict": 8,
+                                            "temperature": 0.0,
+                                            "stream": False,
+                                        },
+                                    )
+
+                            print(f"\nbatch={batch_label} ubatch={ubatch_label}")
+                            col_width = max(7, max(len(str(c)) for c in concurrency_list))
+                            header = ["max_tokens \\ conc".rjust(15)]
+                            header += [str(c).rjust(col_width) for c in concurrency_list]
+                            print(" ".join(header))
+                            print("-" * (len(header) * (col_width + 1)))
+
+                            for max_tokens in max_tokens_list:
+                                row = [str(max_tokens).rjust(15)]
+                                for concurrency in concurrency_list:
+                                    if total_requests_env:
+                                        total_requests = int(total_requests_env)
+                                    else:
+                                        total_requests = max(
+                                            1, concurrency * requests_multiplier
+                                        )
+                                    try:
+                                        result = run_batch(
+                                            proxy["base_url"],
+                                            prompt,
+                                            max_tokens,
+                                            concurrency,
+                                            total_requests,
+                                            temperature,
+                                        )
+                                    except Exception as exc:
+                                        print(
+                                            "error "
+                                            f"batch={batch_label} "
+                                            f"ubatch={ubatch_label} "
+                                            f"max_tokens={max_tokens} "
+                                            f"concurrency={concurrency}: {exc}",
+                                            file=sys.stderr,
+                                        )
+                                        if not continue_on_error:
+                                            raise
+                                        result = {
+                                            "throughput": 0.0,
+                                            "total_tokens": 0,
+                                            "elapsed": 0.0,
+                                            "errors": total_requests,
+                                            "last_error": exc,
+                                        }
+
+                                    if result["errors"] and result["last_error"]:
+                                        print(
+                                            "error "
+                                            f"batch={batch_label} "
+                                            f"ubatch={ubatch_label} "
+                                            f"max_tokens={max_tokens} "
+                                            f"concurrency={concurrency}: "
+                                            f"{result['last_error']}",
+                                            file=sys.stderr,
+                                        )
+
+                                    writer.writerow(
+                                        [
+                                            batch_label,
+                                            ubatch_label,
+                                            max_tokens,
+                                            concurrency,
+                                            f"{result['throughput']:.1f}",
+                                            str(result["total_tokens"]),
+                                            f"{result['elapsed']:.2f}",
+                                            str(result["errors"]),
+                                        ]
+                                    )
+                                    results_file.flush()
+
+                                    if result["throughput"] > best["throughput"]:
+                                        best = {
+                                            "throughput": result["throughput"],
+                                            "tokens": max_tokens,
+                                            "concurrency": concurrency,
+                                            "batch": batch_label,
+                                            "ubatch": ubatch_label,
+                                        }
+                                    row.append(
+                                        _format_cell(result["throughput"], col_width)
+                                    )
+                                    if cell_pause_s > 0:
+                                        time.sleep(cell_pause_s)
+                                print(" ".join(row))
+                except Exception as exc:
+                    print(
+                        f"error batch={batch_label} ubatch={ubatch_label}: {exc}",
+                        file=sys.stderr,
+                    )
+                    if not continue_on_error:
+                        raise
+                    for max_tokens in max_tokens_list:
+                        for concurrency in concurrency_list:
+                            if total_requests_env:
+                                total_requests = int(total_requests_env)
+                            else:
+                                total_requests = max(
+                                    1, concurrency * requests_multiplier
                                 )
-
-                        print(f"\nbatch={batch_label} ubatch={ubatch_label}")
-                        col_width = max(7, max(len(str(c)) for c in concurrency_list))
-                        header = ["max_tokens \\ conc".rjust(15)]
-                        header += [str(c).rjust(col_width) for c in concurrency_list]
-                        print(" ".join(header))
-                        print("-" * (len(header) * (col_width + 1)))
-
-                        for max_tokens in max_tokens_list:
-                            row = [str(max_tokens).rjust(15)]
-                            for concurrency in concurrency_list:
-                                if total_requests_env:
-                                    total_requests = int(total_requests_env)
-                                else:
-                                    total_requests = max(
-                                        1, concurrency * requests_multiplier
-                                    )
-                                throughput = None
-                                try:
-                                    throughput = run_batch(
-                                        proxy["base_url"],
-                                        prompt,
-                                        max_tokens,
-                                        concurrency,
-                                        total_requests,
-                                        temperature,
-                                    )
-                                except Exception as exc:
-                                    print(
-                                        "error "
-                                        f"batch={batch_label} "
-                                        f"ubatch={ubatch_label} "
-                                        f"max_tokens={max_tokens} "
-                                        f"concurrency={concurrency}: {exc}",
-                                        file=sys.stderr,
-                                    )
-                                    if not continue_on_error:
-                                        raise
-                                if (
-                                    throughput is not None
-                                    and throughput > best["throughput"]
-                                ):
-                                    best = {
-                                        "throughput": throughput,
-                                        "tokens": max_tokens,
-                                        "concurrency": concurrency,
-                                        "batch": batch_label,
-                                        "ubatch": ubatch_label,
-                                    }
-                                row.append(_format_cell(throughput, col_width))
-                                if cell_pause_s > 0:
-                                    time.sleep(cell_pause_s)
-                            print(" ".join(row))
-            except Exception as exc:
-                print(
-                    f"error batch={batch_label} ubatch={ubatch_label}: {exc}",
-                    file=sys.stderr,
-                )
-                if not continue_on_error:
-                    raise
-                continue
+                            writer.writerow(
+                                [
+                                    batch_label,
+                                    ubatch_label,
+                                    max_tokens,
+                                    concurrency,
+                                    "0.0",
+                                    "0",
+                                    "0.00",
+                                    str(total_requests),
+                                ]
+                            )
+                            results_file.flush()
+                    continue
+    finally:
+        results_file.close()
 
     print(
         "best "

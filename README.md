@@ -144,6 +144,7 @@ You can supply overrides in the launcher (space-separated `KEY=VALUE` pairs), or
 - `LLAMA_RETRY_SLEEP_S`: base retry backoff (seconds).
 - `LLAMA_CELL_PAUSE_S`: pause between sweep cells (seconds).
 - `LLAMA_WARMUP_REQUESTS`: warmup requests before a sweep run.
+- `LLAMA_RESULTS_DIR`: base directory for sweep output files (default `results`).
 
 ## Examples
 
@@ -172,4 +173,10 @@ LLAMA_INSTANCES_LIST="2,4,8,16" \
 LLAMA_PARALLEL_LIST="16,32,64" \
 LLAMA_CONCURRENCY_LIST="32,64,128" \
 .venv/bin/python scripts/full_sweep.py
+```
+
+Sweep results are written incrementally to:
+```
+results/full_sweep/full_sweep_<timestamp>.csv
+results/round_robin_sweep/round_robin_sweep_<timestamp>.csv
 ```
